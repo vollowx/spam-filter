@@ -2,20 +2,10 @@ const std = @import("std");
 
 const Bow = std.StringHashMap(u32);
 
-fn allocLower(allocator: std.mem.Allocator, str: []const u8) ![]const u8 {
-    var dest = try allocator.alloc(u8, str.len);
-    for (str, 0..) |c, i| {
-        dest[i] = switch (c) {
-            'A'...'Z' => c + 32,
-            else => c,
-        };
-    }
-    return dest;
-}
-
-fn readToEndCountBow(
+fn bowAppendFile(
     allocator: std.mem.Allocator,
     bow: *Bow,
+    bow_token_count: *usize,
     dir: std.fs.Dir,
     relpath: []const u8,
 ) !void {
@@ -28,6 +18,7 @@ fn readToEndCountBow(
 
     var iter = std.mem.tokenizeAny(u8, buffer, " \n\r\t,:.?!");
     while (iter.next()) |word| {
+        bow_token_count.* += 1;
         const lowered = try allocator.dupe(u8, word);
         _ = std.ascii.lowerString(lowered, lowered);
         const result = try bow.getOrPut(lowered);
@@ -40,9 +31,10 @@ fn readToEndCountBow(
     }
 }
 
-fn walkDirCountBow(
+fn bowAppendDir(
     allocator: std.mem.Allocator,
     bow: *Bow,
+    bow_token_count: *usize,
     path: []const u8,
 ) !void {
     var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
@@ -53,7 +45,7 @@ fn walkDirCountBow(
 
     while (try walker.next()) |entry| {
         if (entry.kind != .file) continue;
-        try readToEndCountBow(allocator, bow, dir, entry.path);
+        try bowAppendFile(allocator, bow, bow_token_count, dir, entry.path);
     }
 }
 
@@ -68,10 +60,10 @@ fn classifyFile(
     path: []const u8,
     spam_bow: Bow,
     ham_bow: Bow,
-    spam_total: usize,
-    ham_total: usize,
-    spam_p: f64,
-    ham_p: f64,
+    spam_token_count: usize,
+    ham_token_count: usize,
+    spam_prob: f64,
+    ham_prob: f64,
 ) !ClassificationResult {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
@@ -79,23 +71,23 @@ fn classifyFile(
     const buffer = try file.readToEndAlloc(allocator, (try file.stat()).size);
     defer allocator.free(buffer);
 
-    var spam_score = spam_p;
-    var ham_score = ham_p;
+    var spam_score = spam_prob;
+    var ham_score  = ham_prob;
 
     const vocabulary_size = @as(f64, @floatFromInt(spam_bow.count() + ham_bow.count()));
 
     var iter = std.mem.tokenizeAny(u8, buffer, " \n\r\t,:.?!");
     while (iter.next()) |word| {
-        const lowered = try allocLower(allocator, word);
-        defer allocator.free(lowered);
+        const lowered = try allocator.dupe(u8, word);
+        _ = std.ascii.lowerString(lowered, lowered);
 
         const n_spam = @as(f64, @floatFromInt(spam_bow.get(lowered) orelse 0));
         const n_ham  = @as(f64, @floatFromInt(ham_bow.get(lowered) orelse 0));
 
         // Use Laplace Smoothing (adding 1 to avoid log(0))
         // P(word|spam) = (count in spam + 1) / (total words in spam + vocab size)
-        spam_score += std.math.log10((n_spam + 1.0) / (@as(f64, @floatFromInt(spam_total)) + vocabulary_size));
-        ham_score += std.math.log10((n_ham + 1.0) / (@as(f64, @floatFromInt(ham_total)) + vocabulary_size));
+        spam_score += std.math.log10((n_spam + 1.0) / (@as(f64, @floatFromInt(spam_token_count)) + vocabulary_size));
+        ham_score  += std.math.log10((n_ham + 1.0)  / (@as(f64, @floatFromInt(ham_token_count))  + vocabulary_size));
     }
 
     return ClassificationResult{
@@ -106,33 +98,27 @@ fn classifyFile(
 }
 
 pub fn main() !void {
-    var arena_alloc = std.heap.GeneralPurposeAllocator.init(std.heap.page_allocator);
+    var arena_alloc = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_alloc.deinit();
     const allocator = arena_alloc.allocator();
 
     var spam_bow = Bow.init(allocator);
     var ham_bow = Bow.init(allocator);
 
-    std.debug.print("Training...\n", .{});
-    try walkDirCountBow(allocator, &spam_bow, "./data/enron1/spam");
-    try walkDirCountBow(allocator, &ham_bow, "./data/enron1/ham");
-    std.debug.print("Training done.\n", .{});
+    var spam_token_count: usize = 0;
+    var ham_token_count: usize = 0;
 
-    var spam_total: usize = 0;
-    var ham_total: usize = 0;
+    try bowAppendDir(allocator, &spam_bow, &spam_token_count, "./data/enron1/spam");
+    try bowAppendDir(allocator, &ham_bow,  &ham_token_count,  "./data/enron1/ham");
 
-    var it = spam_bow.iterator();
-    while (it.next()) |entry| { spam_total += entry.value_ptr.*; }
-    it = ham_bow.iterator();
-    while (it.next()) |entry| { ham_total += entry.value_ptr.*; }
+    const total_token_count = @as(f64, @floatFromInt(spam_token_count + ham_token_count));
+    const spam_prob = std.math.log10(@as(f64, @floatFromInt(spam_token_count)) / total_token_count);
+    const ham_prob = std.math.log10(@as(f64, @floatFromInt(ham_token_count)) / total_token_count);
 
-    const total = @as(f64, @floatFromInt(spam_total + ham_total));
-    const spam_p = std.math.log10(@as(f64, @floatFromInt(spam_total)) / total);
-    const ham_p = std.math.log10(@as(f64, @floatFromInt(ham_total)) / total);
+    var spam_count: u32 = 0;
+    var ham_count: u32 = 0;
 
-    std.debug.print("Classifying emails...\n---\n", .{});
-
-    var test_dir = try std.fs.cwd().openDir("./data/enron1/ham", .{ .iterate = true });
+    var test_dir = try std.fs.cwd().openDir("./data/enron1/spam", .{ .iterate = true });
     defer test_dir.close();
     var walker = try test_dir.walk(allocator);
     defer walker.deinit();
@@ -140,24 +126,27 @@ pub fn main() !void {
     while (try walker.next()) |entry| {
         if (entry.kind != .file) continue;
 
-        const full_path = try std.fs.path.join(allocator, &[_][]const u8{ "./data/enron1/ham", entry.path });
+        const full_path = try std.fs.path.join(allocator, &[_][]const u8{ "./data/enron1/spam", entry.path });
 
         const res = try classifyFile(
             allocator,
             full_path,
             spam_bow,
             ham_bow,
-            spam_total,
-            ham_total,
-            spam_p,
-            ham_p
+            spam_token_count,
+            ham_token_count,
+            spam_prob,
+            ham_prob
         );
 
-        std.debug.print("Path: {s: <40} => {s} {} {}\n", .{
-            entry.path,
-            if (res.is_spam) "spam" else "ham ",
-            res.spam_score,
-            res.ham_score,
-        });
+        if (res.is_spam) {
+            spam_count += 1;
+        } else {
+            ham_count += 1;
+        }
     }
+
+    std.debug.print("Acc: {}\n", .{
+        @as(f64, @floatFromInt(ham_count)) / (@as(f64, @floatFromInt(spam_count + ham_count))),
+    });
 }
